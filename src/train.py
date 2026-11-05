@@ -35,15 +35,18 @@ def make_pool(df: pd.DataFrame, feature_cols: list[str], with_label: bool = True
 def default_params() -> dict:
     return {
         "loss_function": "YetiRank",
-        "iterations": 1200,
-        "learning_rate": 0.05,
-        "depth": 6,
-        "l2_leaf_reg": 6.0,
+        "eval_metric": "NDCG:top=10",
+        "iterations": 2000,
+        "learning_rate": 0.04,
+        "depth": 8,
+        "l2_leaf_reg": 4.0,
         "random_seed": 42,
-        "verbose": 100,
+        "verbose": 200,
         "od_type": "Iter",
-        "od_wait": 100,
+        "od_wait": 150,
         "allow_writing_files": False,
+        "bootstrap_type": "Bayesian",
+        "bagging_temperature": 0.8,
     }
 
 

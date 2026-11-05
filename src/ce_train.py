@@ -1,0 +1,177 @@
+"""Fine-tune a small cross-encoder on competition pairs (competition data only)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.model_selection import GroupShuffleSplit
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoModel, AutoTokenizer
+
+
+class PairTextDataset(Dataset):
+    def __init__(self, queries, docs, labels, tokenizer, max_len: int = 192):
+        self.queries = list(queries)
+        self.docs = list(docs)
+        self.labels = np.asarray(labels, dtype=np.float32)
+        self.tok = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        enc = self.tok(
+            self.queries[idx],
+            self.docs[idx],
+            truncation=True,
+            padding="max_length",
+            max_length=self.max_len,
+            return_tensors="pt",
+        )
+        item = {k: v.squeeze(0) for k, v in enc.items()}
+        item["labels"] = torch.tensor(self.labels[idx], dtype=torch.float32)
+        return item
+
+
+class CrossEncoder(nn.Module):
+    def __init__(self, model_name: str):
+        super().__init__()
+        self.encoder = AutoModel.from_pretrained(model_name)
+        hidden = self.encoder.config.hidden_size
+        self.head = nn.Sequential(
+            nn.Dropout(0.1),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, input_ids, attention_mask, token_type_ids=None):
+        kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}
+        if token_type_ids is not None and "token_type_ids" in self.encoder.forward.__code__.co_varnames:
+            kwargs["token_type_ids"] = token_type_ids
+        out = self.encoder(**kwargs)
+        cls = out.last_hidden_state[:, 0]
+        return self.head(cls).squeeze(-1)
+
+
+def _collate(batch):
+    keys = batch[0].keys()
+    return {k: torch.stack([b[k] for b in batch]) for k in keys}
+
+
+def train_cross_encoder(
+    train_df: pd.DataFrame,
+    models_dir: str | Path,
+    model_name: str = "cointegrated/rubert-tiny2",
+    epochs: int = 2,
+    batch_size: int = 32,
+    lr: float = 2e-5,
+    max_len: int = 192,
+    seed: int = 42,
+) -> dict:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    models_dir = Path(models_dir)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"CE device={device}")
+
+    tok = AutoTokenizer.from_pretrained(model_name)
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.12, random_state=seed)
+    tr_idx, va_idx = next(gss.split(train_df, groups=train_df["query_id"]))
+    tr = train_df.iloc[tr_idx]
+    va = train_df.iloc[va_idx]
+
+    def docs(df):
+        return (df["title"].fillna("") + " [SEP] " + df["text"].fillna("")).tolist()
+
+    train_ds = PairTextDataset(tr["query"], docs(tr), tr["relevance"], tok, max_len)
+    valid_ds = PairTextDataset(va["query"], docs(va), va["relevance"], tok, max_len)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=_collate)
+    valid_loader = DataLoader(valid_ds, batch_size=batch_size, shuffle=False, collate_fn=_collate)
+
+    model = CrossEncoder(model_name).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    loss_fn = nn.BCEWithLogitsLoss()
+
+    best_val = float("inf")
+    best_state = None
+    for epoch in range(epochs):
+        model.train()
+        tr_loss = 0.0
+        n = 0
+        for batch in train_loader:
+            labels = batch.pop("labels").to(device)
+            batch = {k: v.to(device) for k, v in batch.items()}
+            opt.zero_grad()
+            logits = model(
+                batch["input_ids"],
+                batch["attention_mask"],
+                batch.get("token_type_ids"),
+            )
+            loss = loss_fn(logits, labels)
+            loss.backward()
+            opt.step()
+            tr_loss += loss.item() * len(labels)
+            n += len(labels)
+        tr_loss /= max(n, 1)
+
+        model.eval()
+        va_loss = 0.0
+        m = 0
+        with torch.no_grad():
+            for batch in valid_loader:
+                labels = batch.pop("labels").to(device)
+                batch = {k: v.to(device) for k, v in batch.items()}
+                logits = model(
+                    batch["input_ids"],
+                    batch["attention_mask"],
+                    batch.get("token_type_ids"),
+                )
+                loss = loss_fn(logits, labels)
+                va_loss += loss.item() * len(labels)
+                m += len(labels)
+        va_loss /= max(m, 1)
+        print(f"ce epoch {epoch+1}/{epochs} train_loss={tr_loss:.4f} val_loss={va_loss:.4f}")
+        if va_loss < best_val:
+            best_val = va_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    out_dir = models_dir / "ce_rubert_tiny2"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    torch.save({"state_dict": model.state_dict(), "model_name": model_name, "max_len": max_len}, out_dir / "model.pt")
+    tok.save_pretrained(out_dir)
+    return {"model": model, "tokenizer": tok, "max_len": max_len, "device": device}
+
+
+@torch.no_grad()
+def predict_cross_encoder(arts: dict, df: pd.DataFrame, batch_size: int = 64) -> np.ndarray:
+    model = arts["model"]
+    tok = arts["tokenizer"]
+    max_len = arts["max_len"]
+    device = arts.get("device", torch.device("cpu"))
+    model.eval()
+    docs = (df["title"].fillna("") + " [SEP] " + df["text"].fillna("")).tolist()
+    queries = df["query"].tolist()
+    preds = []
+    for start in range(0, len(df), batch_size):
+        q = queries[start : start + batch_size]
+        d = docs[start : start + batch_size]
+        enc = tok(
+            q,
+            d,
+            truncation=True,
+            padding=True,
+            max_length=max_len,
+            return_tensors="pt",
+        )
+        enc = {k: v.to(device) for k, v in enc.items()}
+        logits = model(enc["input_ids"], enc["attention_mask"], enc.get("token_type_ids"))
+        preds.append(torch.sigmoid(logits).cpu().numpy())
+    return np.concatenate(preds)

@@ -12,7 +12,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test-path", default="data/test.csv")
     p.add_argument("--models-dir", default="models")
     p.add_argument("--submission-path", default="results/submission.csv")
-    p.add_argument("--no-nn", action="store_true", help="Skip pairwise NN fine-tune")
+    p.add_argument("--no-ce", action="store_true")
+    p.add_argument("--no-lgbm", action="store_true")
     return p.parse_args()
 
 
@@ -23,7 +24,8 @@ def main() -> None:
         train,
         test,
         models_dir=args.models_dir,
-        do_nn=not args.no_nn,
+        do_ce=not args.no_ce,
+        do_lgbm=not args.no_lgbm,
     )
     out = Path(args.submission_path)
     out.parent.mkdir(parents=True, exist_ok=True)

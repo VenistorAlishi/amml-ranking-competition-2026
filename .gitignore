@@ -4,6 +4,7 @@ data/
 cache/
 models/
 models_ce/
+results/
 *.cbm
 *.pkl
 *.joblib
