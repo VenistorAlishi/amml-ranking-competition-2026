@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
 
 
 class PairTextDataset(Dataset):
@@ -378,4 +378,186 @@ def oof_st_cross_encoder_scores(
     out_dir.mkdir(parents=True, exist_ok=True)
     model_full.save(str(out_dir))
     te = _predict(model_full, test_df)
+    return oof, te
+
+
+@torch.no_grad()
+def _predict_seq_ce(
+    model: AutoModelForSequenceClassification,
+    tok: AutoTokenizer,
+    df: pd.DataFrame,
+    *,
+    device: torch.device,
+    max_len: int,
+    batch_size: int,
+) -> np.ndarray:
+    model.eval()
+    docs = (df["title"].fillna("") + " " + df["text"].fillna("")).tolist()
+    queries = df["query"].astype(str).tolist()
+    preds: list[np.ndarray] = []
+    for start in range(0, len(df), batch_size):
+        enc = tok(
+            queries[start : start + batch_size],
+            docs[start : start + batch_size],
+            truncation=True,
+            padding=True,
+            max_length=max_len,
+            return_tensors="pt",
+        )
+        enc = {k: v.to(device) for k, v in enc.items()}
+        logits = model(**enc).logits.squeeze(-1)
+        preds.append(logits.detach().float().cpu().numpy())
+    return np.concatenate(preds).astype(float)
+
+
+def _fit_seq_ce(
+    tr: pd.DataFrame,
+    va: pd.DataFrame | None,
+    *,
+    model_name: str,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    max_len: int,
+    device: torch.device,
+) -> tuple[AutoModelForSequenceClassification, AutoTokenizer]:
+    tok = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=1).to(device)
+    if epochs <= 0:
+        return model, tok
+
+    train_ds = PairTextDataset(
+        tr["query"].astype(str),
+        (tr["title"].fillna("") + " " + tr["text"].fillna("")).tolist(),
+        tr["relevance"],
+        tok,
+        max_len,
+    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=_collate)
+    valid_loader = None
+    if va is not None and len(va):
+        valid_ds = PairTextDataset(
+            va["query"].astype(str),
+            (va["title"].fillna("") + " " + va["text"].fillna("")).tolist(),
+            va["relevance"],
+            tok,
+            max_len,
+        )
+        valid_loader = DataLoader(valid_ds, batch_size=batch_size, shuffle=False, collate_fn=_collate)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    loss_fn = nn.BCEWithLogitsLoss()
+    best_val = float("inf")
+    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    for epoch in range(epochs):
+        model.train()
+        tr_loss = 0.0
+        n = 0
+        for batch in train_loader:
+            labels = batch.pop("labels").to(device)
+            batch = {k: v.to(device) for k, v in batch.items()}
+            opt.zero_grad()
+            logits = model(**batch).logits.squeeze(-1)
+            loss = loss_fn(logits, labels)
+            loss.backward()
+            opt.step()
+            tr_loss += loss.item() * len(labels)
+            n += len(labels)
+        tr_loss /= max(n, 1)
+
+        va_loss = tr_loss
+        if valid_loader is not None:
+            model.eval()
+            va_loss = 0.0
+            m = 0
+            with torch.no_grad():
+                for batch in valid_loader:
+                    labels = batch.pop("labels").to(device)
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    logits = model(**batch).logits.squeeze(-1)
+                    loss = loss_fn(logits, labels)
+                    va_loss += loss.item() * len(labels)
+                    m += len(labels)
+            va_loss /= max(m, 1)
+        print(f"seq-ce epoch {epoch+1}/{epochs} train_loss={tr_loss:.4f} val_loss={va_loss:.4f}")
+        if va_loss <= best_val:
+            best_val = va_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    model.load_state_dict(best_state)
+    return model, tok
+
+
+def oof_hf_sequence_ce_scores(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    *,
+    models_dir: str | Path = "models",
+    model_name: str = "DiTy/cross-encoder-russian-msmarco",
+    n_splits: int = 5,
+    epochs: int = 1,
+    batch_size: int = 16,
+    lr: float = 2e-5,
+    max_len: int = 256,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """OOF CE via HF SequenceClassification — keeps DiTy/MS MARCO ranking head (no ST.fit)."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"HF-CE OOF device={device} model={model_name} epochs={epochs} folds={n_splits}")
+
+    oof = np.zeros(len(train_df), dtype=float)
+    if epochs <= 0:
+        print("Frozen pretrained CE (no competition fine-tune)...")
+        model, tok = _fit_seq_ce(
+            train_df,
+            None,
+            model_name=model_name,
+            epochs=0,
+            batch_size=batch_size,
+            lr=lr,
+            max_len=max_len,
+            device=device,
+        )
+        oof = _predict_seq_ce(model, tok, train_df, device=device, max_len=max_len, batch_size=batch_size * 2)
+        te = _predict_seq_ce(model, tok, test_df, device=device, max_len=max_len, batch_size=batch_size * 2)
+        return oof, te
+
+    gkf = GroupKFold(n_splits=n_splits)
+    for fold, (tr_idx, va_idx) in enumerate(gkf.split(train_df, train_df["relevance"], groups=train_df["query_id"])):
+        tr = train_df.iloc[tr_idx].reset_index(drop=True)
+        va = train_df.iloc[va_idx].reset_index(drop=True)
+        print(f"HF-CE fold {fold}: train={len(tr)} valid={len(va)}")
+        model, tok = _fit_seq_ce(
+            tr,
+            va,
+            model_name=model_name,
+            epochs=epochs,
+            batch_size=batch_size,
+            lr=lr,
+            max_len=max_len,
+            device=device,
+        )
+        oof[va_idx] = _predict_seq_ce(model, tok, va, device=device, max_len=max_len, batch_size=batch_size * 2)
+
+    print("HF-CE full-data fit for test...")
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.1, random_state=seed)
+    tr_idx, va_idx = next(gss.split(train_df, groups=train_df["query_id"]))
+    model, tok = _fit_seq_ce(
+        train_df.iloc[tr_idx].reset_index(drop=True),
+        train_df.iloc[va_idx].reset_index(drop=True),
+        model_name=model_name,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        max_len=max_len,
+        device=device,
+    )
+    out_dir = Path(models_dir) / "ce_hf_dity"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(out_dir)
+    tok.save_pretrained(out_dir)
+    te = _predict_seq_ce(model, tok, test_df, device=device, max_len=max_len, batch_size=batch_size * 2)
     return oof, te
