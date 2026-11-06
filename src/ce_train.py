@@ -353,7 +353,9 @@ def oof_st_cross_encoder_scores(
 
             kwargs["evaluator"] = CEBinaryClassificationEvaluator.from_input_examples(_pairs(va), name="val")
             kwargs["evaluation_steps"] = max(50, len(loader))
-        model.fit(**kwargs)
+        # Prefer pre-v4 training loop on Kaggle (fit() may require datasets / break).
+        fit_fn = getattr(model, "old_fit", None) or model.fit
+        fit_fn(**kwargs)
         return model
 
     oof = np.zeros(len(train_df), dtype=float)
