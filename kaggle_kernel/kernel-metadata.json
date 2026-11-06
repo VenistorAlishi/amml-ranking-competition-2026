@@ -1,6 +1,6 @@
 {
-  "id": "primalaspid/amml-ranking-2026-gpu",
-  "title": "AMML Ranking 2026 GPU CE+CatBoost",
+  "id": "primalaspid/amml-ranking-2026-gpu-ce-catboost",
+  "title": "amml-ranking-2026-gpu-ce-catboost",
   "code_file": "amml-ranking-2026-gpu.ipynb",
   "language": "python",
   "kernel_type": "notebook",
@@ -8,7 +8,7 @@
   "enable_gpu": true,
   "enable_tpu": false,
   "enable_internet": true,
-  "dataset_sources": [],
+  "dataset_sources": ["primalaspid/amml-ranking-2026-code"],
   "competition_sources": ["amml-ranking-competition-2026"],
   "kernel_sources": [],
   "model_sources": []
