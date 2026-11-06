@@ -355,7 +355,13 @@ def oof_st_cross_encoder_scores(
             kwargs["evaluation_steps"] = max(50, len(loader))
         # Prefer pre-v4 training loop on Kaggle (fit() may require datasets / break).
         fit_fn = getattr(model, "old_fit", None) or model.fit
-        fit_fn(**kwargs)
+        try:
+            fit_fn(**kwargs)
+        except Exception as e:
+            print("ST fit failed:", e, "— retrying without evaluator")
+            kwargs.pop("evaluator", None)
+            kwargs.pop("evaluation_steps", None)
+            fit_fn(**kwargs)
         return model
 
     oof = np.zeros(len(train_df), dtype=float)
