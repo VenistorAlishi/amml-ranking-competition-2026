@@ -297,7 +297,7 @@ def oof_cross_encoder_scores(
         device=device,
     )
     models_dir = Path(models_dir)
-    out_dir = models_dir / "ce_rubert_tiny2"
+    out_dir = models_dir / "ce_oof"
     out_dir.mkdir(parents=True, exist_ok=True)
     torch.save(
         {"state_dict": arts_full["model"].state_dict(), "model_name": model_name, "max_len": max_len},
@@ -305,4 +305,75 @@ def oof_cross_encoder_scores(
     )
     arts_full["tokenizer"].save_pretrained(out_dir)
     te = predict_cross_encoder(arts_full, test_df, batch_size=batch_size * 2)
+    return oof, te
+
+
+def oof_st_cross_encoder_scores(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    *,
+    models_dir: str | Path = "models",
+    model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+    n_splits: int = 5,
+    epochs: int = 2,
+    batch_size: int = 32,
+    max_len: int = 256,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """OOF CE via sentence-transformers CrossEncoder (keeps pretrained ranking head)."""
+    from sentence_transformers import CrossEncoder as STCrossEncoder
+    from sentence_transformers import InputExample
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"ST-CE OOF device={device} model={model_name} folds={n_splits}")
+
+    def _pairs(df: pd.DataFrame) -> list[InputExample]:
+        out = []
+        for q, title, text, y in zip(df["query"], df["title"], df["text"], df["relevance"]):
+            out.append(InputExample(texts=[str(q), f"{title} {text}".strip()], label=float(y)))
+        return out
+
+    def _predict(model: STCrossEncoder, df: pd.DataFrame) -> np.ndarray:
+        pairs = [[str(q), f"{title} {text}".strip()] for q, title, text in zip(df["query"], df["title"], df["text"])]
+        return np.asarray(model.predict(pairs, batch_size=batch_size * 2, show_progress_bar=False), dtype=float)
+
+    def _fit(tr: pd.DataFrame, va: pd.DataFrame | None) -> STCrossEncoder:
+        model = STCrossEncoder(model_name, num_labels=1, max_length=max_len, device=device)
+        loader = DataLoader(_pairs(tr), shuffle=True, batch_size=batch_size)
+        kwargs = {
+            "train_dataloader": loader,
+            "epochs": epochs,
+            "warmup_steps": max(10, int(len(loader) * epochs * 0.1)),
+            "show_progress_bar": True,
+        }
+        if va is not None and len(va):
+            from sentence_transformers.cross_encoder.evaluation import CEBinaryClassificationEvaluator
+
+            kwargs["evaluator"] = CEBinaryClassificationEvaluator.from_input_examples(_pairs(va), name="val")
+            kwargs["evaluation_steps"] = max(50, len(loader))
+        model.fit(**kwargs)
+        return model
+
+    oof = np.zeros(len(train_df), dtype=float)
+    gkf = GroupKFold(n_splits=n_splits)
+    for fold, (tr_idx, va_idx) in enumerate(gkf.split(train_df, train_df["relevance"], groups=train_df["query_id"])):
+        tr = train_df.iloc[tr_idx].reset_index(drop=True)
+        va = train_df.iloc[va_idx].reset_index(drop=True)
+        print(f"ST-CE fold {fold}: train={len(tr)} valid={len(va)}")
+        model = _fit(tr, va)
+        oof[va_idx] = _predict(model, va)
+
+    print("ST-CE full-data fit for test...")
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.1, random_state=seed)
+    tr_idx, va_idx = next(gss.split(train_df, groups=train_df["query_id"]))
+    model_full = _fit(
+        train_df.iloc[tr_idx].reset_index(drop=True),
+        train_df.iloc[va_idx].reset_index(drop=True),
+    )
+    out_dir = Path(models_dir) / "ce_st_mmarco"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_full.save(str(out_dir))
+    te = _predict(model_full, test_df)
     return oof, te
