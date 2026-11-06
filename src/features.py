@@ -181,11 +181,27 @@ def assemble_features(train_df: pd.DataFrame, test_df: pd.DataFrame) -> tuple[pd
         feat["passage_index"] = base["passage_index"].to_numpy()
         feat["article_passage_count"] = base["article_passage_count"].to_numpy()
         feat["article_char_count"] = base["article_char_count"].to_numpy()
-        feat["passage_frac"] = np.where(
-            base["article_passage_count"].to_numpy() > 0,
-            base["passage_index"].to_numpy() / base["article_passage_count"].to_numpy(),
-            -1.0,
-        )
+        # Prefer cleaned ratios/flags from prepare_frame when present
+        if "passage_frac" in base.columns:
+            feat["passage_frac"] = base["passage_frac"].to_numpy()
+        else:
+            feat["passage_frac"] = np.where(
+                base["article_passage_count"].to_numpy() > 0,
+                base["passage_index"].to_numpy() / base["article_passage_count"].to_numpy(),
+                -1.0,
+            )
+        for col in (
+            "title_missing",
+            "text_had_html",
+            "article_char_count_raw_bad",
+            "passage_oob",
+            "char_vs_stated",
+            "doc_char_len",
+            "title_char_len",
+            "text_char_len",
+        ):
+            if col in base.columns:
+                feat[col] = base[col].to_numpy()
         feat["ingest_source"] = base["ingest_source"].to_numpy()
         feat["query_id"] = base["query_id"].to_numpy()
         feat["id"] = base["id"].to_numpy()
