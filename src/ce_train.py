@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModel, AutoTokenizer
 
@@ -175,3 +175,134 @@ def predict_cross_encoder(arts: dict, df: pd.DataFrame, batch_size: int = 64) ->
         logits = model(enc["input_ids"], enc["attention_mask"], enc.get("token_type_ids"))
         preds.append(torch.sigmoid(logits).cpu().numpy())
     return np.concatenate(preds)
+
+
+def _docs(df: pd.DataFrame) -> list[str]:
+    return (df["title"].fillna("") + " [SEP] " + df["text"].fillna("")).tolist()
+
+
+def _fit_ce(
+    tr: pd.DataFrame,
+    va: pd.DataFrame | None,
+    *,
+    model_name: str,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    max_len: int,
+    device: torch.device,
+) -> dict:
+    tok = AutoTokenizer.from_pretrained(model_name)
+    train_ds = PairTextDataset(tr["query"], _docs(tr), tr["relevance"], tok, max_len)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=_collate)
+    valid_loader = None
+    if va is not None and len(va):
+        valid_ds = PairTextDataset(va["query"], _docs(va), va["relevance"], tok, max_len)
+        valid_loader = DataLoader(valid_ds, batch_size=batch_size, shuffle=False, collate_fn=_collate)
+
+    model = CrossEncoder(model_name).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    loss_fn = nn.BCEWithLogitsLoss()
+    best_val = float("inf")
+    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    for epoch in range(epochs):
+        model.train()
+        tr_loss = 0.0
+        n = 0
+        for batch in train_loader:
+            labels = batch.pop("labels").to(device)
+            batch = {k: v.to(device) for k, v in batch.items()}
+            opt.zero_grad()
+            logits = model(batch["input_ids"], batch["attention_mask"], batch.get("token_type_ids"))
+            loss = loss_fn(logits, labels)
+            loss.backward()
+            opt.step()
+            tr_loss += loss.item() * len(labels)
+            n += len(labels)
+        tr_loss /= max(n, 1)
+
+        va_loss = tr_loss
+        if valid_loader is not None:
+            model.eval()
+            va_loss = 0.0
+            m = 0
+            with torch.no_grad():
+                for batch in valid_loader:
+                    labels = batch.pop("labels").to(device)
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    logits = model(batch["input_ids"], batch["attention_mask"], batch.get("token_type_ids"))
+                    loss = loss_fn(logits, labels)
+                    va_loss += loss.item() * len(labels)
+                    m += len(labels)
+            va_loss /= max(m, 1)
+        print(f"ce epoch {epoch+1}/{epochs} train_loss={tr_loss:.4f} val_loss={va_loss:.4f}")
+        if va_loss <= best_val:
+            best_val = va_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    model.load_state_dict(best_state)
+    return {"model": model, "tokenizer": tok, "max_len": max_len, "device": device}
+
+
+def oof_cross_encoder_scores(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    *,
+    models_dir: str | Path = "models",
+    model_name: str = "cointegrated/rubert-tiny2",
+    n_splits: int = 5,
+    epochs: int = 2,
+    batch_size: int = 64,
+    lr: float = 2e-5,
+    max_len: int = 192,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Honest CE scores: GroupKFold OOF on train + full-data CE for test."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"CE OOF device={device} folds={n_splits}")
+
+    oof = np.zeros(len(train_df), dtype=float)
+    gkf = GroupKFold(n_splits=n_splits)
+    for fold, (tr_idx, va_idx) in enumerate(gkf.split(train_df, train_df["relevance"], groups=train_df["query_id"])):
+        tr = train_df.iloc[tr_idx].reset_index(drop=True)
+        va = train_df.iloc[va_idx].reset_index(drop=True)
+        print(f"CE fold {fold}: train={len(tr)} valid={len(va)}")
+        arts = _fit_ce(
+            tr,
+            va,
+            model_name=model_name,
+            epochs=epochs,
+            batch_size=batch_size,
+            lr=lr,
+            max_len=max_len,
+            device=device,
+        )
+        oof[va_idx] = predict_cross_encoder(arts, va, batch_size=batch_size * 2)
+
+    print("CE full-data fit for test...")
+    # small holdout only for early stopping
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.1, random_state=seed)
+    tr_idx, va_idx = next(gss.split(train_df, groups=train_df["query_id"]))
+    arts_full = _fit_ce(
+        train_df.iloc[tr_idx].reset_index(drop=True),
+        train_df.iloc[va_idx].reset_index(drop=True),
+        model_name=model_name,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        max_len=max_len,
+        device=device,
+    )
+    models_dir = Path(models_dir)
+    out_dir = models_dir / "ce_rubert_tiny2"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {"state_dict": arts_full["model"].state_dict(), "model_name": model_name, "max_len": max_len},
+        out_dir / "model.pt",
+    )
+    arts_full["tokenizer"].save_pretrained(out_dir)
+    te = predict_cross_encoder(arts_full, test_df, batch_size=batch_size * 2)
+    return oof, te
