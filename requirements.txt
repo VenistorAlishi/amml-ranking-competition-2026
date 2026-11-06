@@ -3,7 +3,9 @@ pandas==2.2.3
 scikit-learn==1.5.2
 catboost==1.2.3
 rank-bm25==0.2.2
-torch==2.2.2
+torch>=2.6
+transformers>=4.45
+lightgbm>=4.0
 joblib==1.4.2
 kaggle>=1.6.0
 tqdm==4.67.1
